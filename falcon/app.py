@@ -64,6 +64,7 @@ from falcon.request import Request
 from falcon.request import RequestOptions
 from falcon.response import Response
 from falcon.response import ResponseOptions
+from falcon.routing import settlement
 import falcon.status_codes as status
 from falcon.typing import ReadableIO
 from falcon.util import deprecation
@@ -249,7 +250,9 @@ class App(Generic[_ReqT, _RespT]):
         '_response_type',
         '_router_search',
         '_router',
+        '_route_table_epoch',
         '_serialize_error',
+        '_settlement',
         '_sink_and_static_routes',
         '_sink_before_static_route',
         '_sinks',
@@ -270,7 +273,9 @@ class App(Generic[_ReqT, _RespT]):
     # NOTE(caselit): this should actually be a protocol of the methods required
     # by a router, hardcoded to CompiledRouter for convenience for now.
     _router: routing.CompiledRouter
+    _route_table_epoch: int
     _serialize_error: ErrorSerializer[_ReqT, _RespT]
+    _settlement: routing.RouteSettlement | None
     _sink_and_static_routes: tuple[
         tuple[
             Pattern[str] | routing.StaticRoute,
@@ -376,6 +381,11 @@ class App(Generic[_ReqT, _RespT]):
         self._sinks = []
         self._static_routes = []
         self._sink_and_static_routes = ()
+        # Bumped whenever the sink/static route table is rebuilt; settlement
+        # records snapshot the epoch in effect at request time.
+        self._route_table_epoch = 0
+        # Opt-in route settlement; None preserves the default behavior.
+        self._settlement = None
 
         self._unprepared_middleware = []
         self._independent_middleware = independent_middleware
@@ -515,6 +525,9 @@ class App(Generic[_ReqT, _RespT]):
             body = []
             length = 0
             req_succeeded = False
+
+        if self._settlement is not None:
+            self._settlement_finalize(resp, body)
 
         try:
             resp_status: str = code_to_http_status(resp.status)
@@ -812,6 +825,8 @@ class App(Generic[_ReqT, _RespT]):
             fallback_filename=fallback_filename,
         )
         self._static_routes.insert(0, (sr, sr, False))
+        if self._settlement is not None:
+            self._settlement.note_route_table(settlement.TABLE_STATIC, prefix)
         self._update_sink_and_static_routes()
 
     def add_sink(
@@ -901,6 +916,8 @@ class App(Generic[_ReqT, _RespT]):
         # in the case of a duplicate prefix, the last one added
         # is preferred.
         self._sinks.insert(0, (prefix, sink, True))
+        if self._settlement is not None:
+            self._settlement.note_route_table(settlement.TABLE_SINK, prefix.pattern)
         self._update_sink_and_static_routes()
 
     @overload
@@ -1274,8 +1291,32 @@ class App(Generic[_ReqT, _RespT]):
                 #   needed when just looking at the code in the responder
                 #   module, so we just grab it directly here.
                 responder = self.__class__._default_responder_bad_request
+                outcome = settlement.OUTCOME_BAD_REQUEST
+            else:
+                # NOTE: default 405/OPTIONS responders are stamped by
+                #   set_default_responders(); explicit responders fall back
+                #   to the resource-hit label without key-name enumeration.
+                outcome = getattr(
+                    responder,
+                    settlement.SETTLEMENT_OUTCOME_ATTR,
+                    settlement.OUTCOME_RESOURCE_HIT,
+                )
+
+            if self._settlement is not None:
+                self._settlement.open_record(
+                    method=method,
+                    path=path,
+                    plane=settlement.PLANE_RESOURCE,
+                    outcome=outcome,
+                    params=params,
+                    allowed_methods=getattr(
+                        responder, settlement.SETTLEMENT_ALLOWED_ATTR, None
+                    ),
+                    uri_template=uri_template,
+                )
         else:
             params = {}
+            matched_is_sink: bool | None = None
 
             for matcher, obj, is_sink in self._sink_and_static_routes:
                 m = matcher.match(path)
@@ -1283,12 +1324,79 @@ class App(Generic[_ReqT, _RespT]):
                     if is_sink:
                         params = m.groupdict()  # type: ignore[union-attr]
                     responder = obj  # type: ignore[assignment,unused-ignore]
+                    matched_is_sink = is_sink
 
                     break
             else:
                 responder = self.__class__._default_responder_path_not_found
 
+            if self._settlement is not None:
+                if matched_is_sink is None:
+                    plane = settlement.PLANE_NOT_FOUND
+                    outcome = settlement.OUTCOME_ROUTE_NOT_FOUND
+                elif matched_is_sink:
+                    plane = settlement.PLANE_SINK
+                    outcome = settlement.OUTCOME_SINK_MATCHED
+                else:
+                    plane = settlement.PLANE_STATIC
+                    outcome = settlement.OUTCOME_STATIC_MATCHED
+
+                self._settlement.open_record(
+                    method=method,
+                    path=path,
+                    plane=plane,
+                    outcome=outcome,
+                    params=params,
+                    converter_failure=self._settlement_diagnose(path),
+                )
+
         return (responder, params, resource, uri_template)
+
+    def _settlement_diagnose(self, path: str) -> str:
+        """Classify a resource-plane miss for the active settlement.
+
+        Custom routers that do not expose the settlement diagnostic are
+        treated as a structural miss rather than a converter rejection.
+
+        Args:
+            path: The request path that failed to match a resource.
+
+        Returns:
+            str: One of the settlement diagnostic label constants.
+        """
+
+        diagnose = getattr(self._router, 'settlement_diagnose', None)
+        if diagnose is None:
+            return settlement.NO_TEMPLATE_MATCH
+        return cast(str, diagnose(path))
+
+    def _settlement_finalize(self, resp: _RespT, body: Iterable[bytes] | None) -> None:
+        """Snapshot the observable terminal state of a settled request.
+
+        Args:
+            resp: The response after all middleware and responders ran.
+            body: The rendered body chunks, when available as an
+                in-memory sequence; streaming iterables are left alone.
+        """
+
+        record = settlement.current_record()
+        if record is None:
+            return
+
+        body_text = resp.text
+        if body_text is None and isinstance(body, (list, tuple)) and body:
+            try:
+                body_text = b''.join(body).decode('utf-8', 'replace')
+            except TypeError:
+                body_text = None
+
+        assert self._settlement is not None
+        self._settlement.finalize_record(
+            record,
+            status=cast(str, resp.status),
+            allow_header=resp._headers.get('allow'),
+            body_text=body_text,
+        )
 
     def _compose_status_response(
         self, req: _ReqT, resp: _RespT, http_status: HTTPStatus
@@ -1496,11 +1604,42 @@ class App(Generic[_ReqT, _RespT]):
 
         return [], 0
 
+    def enable_route_settlement(self) -> routing.RouteSettlement:
+        """Enable declarative route settlement on this app.
+
+        The returned :class:`~falcon.routing.RouteSettlement` records the
+        routing plane and observable terminal state of every subsequent
+        request, and freezes them into immutable epochs. Enabling is
+        idempotent; call :meth:`disable_route_settlement` to restore the
+        default behavior. No new constructor parameter is required.
+
+        Returns:
+            RouteSettlement: The settlement session attached to this app.
+        """
+
+        if self._settlement is None:
+            self._settlement = routing.RouteSettlement(self)
+            self._settlement.attach()
+        return self._settlement
+
+    def disable_route_settlement(self) -> None:
+        """Disable route settlement and detach the active session, if any."""
+
+        if self._settlement is not None:
+            self._settlement.detach()
+            self._settlement = None
+
     def _update_sink_and_static_routes(self) -> None:
         if self._sink_before_static_route:
             self._sink_and_static_routes = tuple(self._sinks + self._static_routes)  # type: ignore[operator]
         else:
             self._sink_and_static_routes = tuple(self._static_routes + self._sinks)  # type: ignore[operator]
+
+        self._route_table_epoch += 1
+        if self._settlement is not None:
+            self._settlement.note_route_table(
+                settlement.TABLE_REORDER, self._route_table_epoch
+            )
 
 
 # TODO(myusko): This class is a compatibility alias, and should be removed

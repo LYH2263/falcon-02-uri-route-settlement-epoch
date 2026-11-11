@@ -653,6 +653,9 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
             req_succeeded = False
 
+        if self._settlement is not None:
+            self._settlement_finalize(resp, [data] if data is not None else None)
+
         try:
             resp_status: int = resp.status_code
             default_media_type: str | None = self.resp_options.default_media_type

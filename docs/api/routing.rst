@@ -472,6 +472,30 @@ Default Router
     :members:
 
 
+Route Settlement
+----------------
+
+Falcon can optionally settle every routing decision into an immutable,
+epoch-based :class:`~.RouteSettlement` session. While a settlement is
+attached, each request is labeled with the routing plane that handled it
+(resource, sink, static route, or the not-found fallback), together with a
+snapshot of the observable terminal state (status, body text, and the
+``Allow`` header). Records collected in one epoch are frozen by
+:meth:`~.RouteSettlement.advance`; frozen records are never rewritten by
+later router calls, sink/static reordering, or converter-table changes. The
+feature is opt-in via :meth:`falcon.App.enable_route_settlement` and leaves
+the default behavior unchanged while disabled.
+
+.. autoclass:: falcon.routing.RouteSettlement
+    :members:
+
+.. autoclass:: falcon.routing.SettlementRecord
+    :members:
+
+.. autoclass:: falcon.routing.SettlementFrozenError
+    :members:
+
+
 Routing Utilities
 -----------------
 

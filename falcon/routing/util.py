@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from falcon import constants
 from falcon import responders
+from falcon.routing import settlement
 
 if TYPE_CHECKING:
     from falcon._typing import AsgiResponderCallable
@@ -118,19 +119,33 @@ def set_default_responders(
     if 'OPTIONS' not in method_map:
         # OPTIONS itself is intentionally excluded from the Allow header
         opt_responder = responders.create_default_options(allowed_methods, asgi=asgi)
+        settlement.tag_default_responder(
+            opt_responder, settlement.OUTCOME_OPTIONS_DEFAULT, None
+        )
         method_map['OPTIONS'] = opt_responder  # type: ignore[assignment]
         allowed_methods.append('OPTIONS')
 
     if 'WEBSOCKET' not in method_map:
         # Explicitly assign 405 Method Not Allowed to avoid
         # using the default responder for WEBSOCKET
-        method_map['WEBSOCKET'] = responders.create_method_not_allowed(
+        ws_not_allowed = responders.create_method_not_allowed(
             allowed_methods, asgi=asgi
-        )  # type: ignore[assignment]
+        )
+        settlement.tag_default_responder(
+            ws_not_allowed,
+            settlement.OUTCOME_METHOD_NOT_ALLOWED,
+            tuple(allowed_methods),
+        )
+        method_map['WEBSOCKET'] = ws_not_allowed  # type: ignore[assignment]
 
     if default_responder is None:
         default_responder = responders.create_method_not_allowed(
             allowed_methods, asgi=asgi
+        )
+        settlement.tag_default_responder(
+            default_responder,
+            settlement.OUTCOME_METHOD_NOT_ALLOWED,
+            tuple(allowed_methods),
         )
 
     for method in constants.COMBINED_METHODS:
